@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
 Block-wise FP8 E4M3 quantization for Qwen3.5 finetuned models.
-Matches the exact tensor format (weight + weight_scale_inv) of the official
-Qwen3.5-397B-A17B-FP8 checkpoint, processed one shard at a time.
+Supports all Qwen3.5 sizes across both MoE and dense families:
+
+  MoE   : 397B-A17B, 122B-A10B, 35B-A3B
+  Dense : 27B, 9B, 4B, 2B, 0.8B
+
+Produces a checkpoint compatible with the official Qwen3.5 FP8 format,
+loading directly in vLLM and SGLang without engine modifications.
 
 ─────────────────────────────────────────────────────────────────────────────
 PERFORMANCE MODEL
@@ -186,18 +191,42 @@ TARGET_MAX_ABS_ERR  = MAX_ERR_BANDS.warn
 # ── Tensor eligibility ─────────────────────────────────────────────────────────
 
 SKIP_PATTERNS = [
+    # ── Embeddings & output ────────────────────────────────────────────────────
     "embed_tokens",        # token embedding lookup table
     "lm_head",             # output projection / tied embedding
-    "norm",                # all RMSNorm / LayerNorm weights
-    "layernorm",
-    "A_log",               # Mamba/DeltaNet SSM state parameter (kept F32)
+
+    # ── Normalization ──────────────────────────────────────────────────────────
+    "norm",                # all RMSNorm / LayerNorm weights (input_layernorm,
+    "layernorm",           # post_attention_layernorm, linear_attn.norm, ...)
+
+    # ── Gated DeltaNet (linear attention) SSM tensors ─────────────────────────
+    "A_log",               # SSM state parameter (kept F32 in all checkpoints)
     "dt_bias",             # SSM delta-time bias
     "conv1d",              # SSM local convolution
-    "in_proj_a",           # low-rank projection [64, 4096]
-    "in_proj_b",           # low-rank projection [64, 4096]
-    "shared_expert_gate",  # MoE router gate [1, 4096]
-    "weight_scale_inv",    # the inverse-scale tensors themselves
-    "bias",                # all bias terms
+
+    # ── Low-rank / small linear_attn projections ───────────────────────────────
+    "in_proj_a",           # [heads, hidden] — e.g. [64, 4096]; too small
+    "in_proj_b",           # [heads, hidden] — always < BLOCK_SIZE in first dim
+
+    # ── MoE router ────────────────────────────────────────────────────────────
+    "shared_expert_gate",  # router gate  [1, hidden] — always 1 row
+    "mlp.gate.",           # expert router [n_experts, hidden] e.g. [512, 4096]
+                           # trailing dot ensures we match mlp.gate.weight but
+                           # NOT mlp.gate_proj.weight (the dense MLP projection)
+
+    # ── Multi-Token Prediction fusion ─────────────────────────────────────────
+    "mtp.fc",              # MTP hidden-state fusion [hidden, 2*hidden], BF16
+                           # in every official FP8 checkpoint across all sizes
+
+    # ── Vision encoder ────────────────────────────────────────────────────────
+    "visual",              # entire model.visual.* subtree — ViT blocks, merger,
+                           # patch_embed, pos_embed; never FP8 in any checkpoint
+
+    # ── Scale tensors themselves ───────────────────────────────────────────────
+    "weight_scale_inv",    # the inverse-scale tensors we write
+
+    # ── Bias terms ────────────────────────────────────────────────────────────
+    "bias",                # all bias terms (rare in these models but safe)
 ]
 
 
