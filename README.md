@@ -27,7 +27,8 @@ Scales are block-wise: one BF16 inverse-scale per 128×128 tile.
 At inference the engine dequantizes as `W_fp32 ≈ W_fp8 × scale_inv`.
 
 Numerically sensitive tensors (embeddings, norms, SSM parameters, router
-gates, low-rank projections) are passed through unchanged in BF16/F32.
+gates, low-rank projections, and `linear_attn.out_proj`) are passed through
+unchanged in BF16/F32.
 
 ---
 
@@ -320,13 +321,11 @@ The same eligibility rules apply across all model sizes. Eligible tensors are la
 |---|---|---|
 | `*linear_attn.in_proj_qkv.weight` | [12288, 4096] | All sizes |
 | `*linear_attn.in_proj_z.weight` | [8192, 4096] | All sizes |
-| `*linear_attn.out_proj.weight` | [4096, 8192] | All sizes |
 | `*self_attn.q_proj.weight` | [16384, 4096] | All sizes |
 | `*self_attn.k_proj.weight` | [512, 4096] | All sizes |
 | `*self_attn.v_proj.weight` | [512, 4096] | All sizes |
 | `*self_attn.o_proj.weight` | [4096, 8192] | All sizes |
 | `*mlp.experts.*.{down,gate,up}_proj.weight` | [4096, 1024] | MoE only |
-| `*mlp.shared_expert.{down,gate,up}_proj.weight` | [4096, 1024] | MoE only |
 | `*mlp.{down,gate,up}_proj.weight` | [5120, 17408] | Dense only |
 | `mtp.layers.0.*` (attention + MLP) | varies | All sizes |
 
@@ -337,9 +336,11 @@ The same eligibility rules apply across all model sizes. Eligible tensors are la
 | `embed_tokens.weight`, `lm_head.weight` | BF16 | Embedding lookup, no matmul |
 | `*norm*`, `*layernorm*` | BF16 | Numerically sensitive |
 | `*linear_attn.in_proj_a/b.weight` | BF16 | Low-rank [heads, hidden]; first dim < 128 |
+| `*linear_attn.out_proj.weight` | BF16 | E4M3 MaxAE stays above verifier hard limits on large finetunes |
 | `*linear_attn.A_log` | F32 | SSM state parameter |
 | `*linear_attn.dt_bias`, `*conv1d*` | BF16 | SSM auxiliary tensors |
 | `*shared_expert_gate.weight` | BF16 | Router gate [1, hidden] |
+| `*mlp.shared_expert.{down,gate,up}_proj.weight` | BF16 | Shared-expert MLP projections show repeatable E4M3 MaxAE failures on large finetunes |
 | `*mlp.gate.weight` | BF16 | Expert router [n_experts, hidden] |
 | `mtp.fc.weight` | BF16 | MTP hidden-state fusion; BF16 in all official checkpoints |
 | `model.visual.*` | BF16 | Entire vision encoder (ViT blocks, merger, patch embed) |
