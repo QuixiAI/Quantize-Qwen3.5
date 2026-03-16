@@ -14,49 +14,53 @@ Registers forward hooks on every eligible linear layer, runs a small set of
 calibration prompts through the model in BF16, and records the per-input-
 channel maximum absolute activation seen across all tokens and all prompts.
 
-The result is a JSON file consumed by quantize_fp8.py --activation_stats.
+After collection, stats keys are normalised to exactly match the safetensors
+key format used in the model's own weight files.  This means quantize_fp8.py
+will always find exact matches — no prefix-stripping fallback needed.
 
 Output format
 ─────────────
     {
-      "model.layers.0.mlp.experts.0.down_proj.weight": {
+      "model.language_model.layers.0.mlp.experts.0.down_proj.weight": {
         "input_channel_max": [0.34, 0.12, ...]   // length == in_features
       },
       ...
     }
 
+Keys always match the safetensors weight names exactly.
+
 Hardware requirements
 ─────────────────────
 Running a 397B model requires a multi-GPU setup (8× H100 80 GB or similar).
-Use tensor_parallel via accelerate / vLLM offline batching / FSDP for loading.
+Use device_map="auto" with accelerate for multi-GPU loading.
 
 For smaller models (9B and below) this script runs on a single GPU.
 
 Usage
 ─────
-  # Minimal (uses built-in default prompts)
+  # Standard (auto multi-GPU, built-in prompts)
   python collect_activation_stats.py \\
-      --model_dir /models/bf16_finetune \\
-      --output    calib_stats.json
+      --model_dir ~/models/bf16_finetune \\
+      --output    calib_stats_397b.json
 
-  # Custom calibration prompts from a text file (one prompt per line)
+  # Short tokens to save time — activation magnitudes stabilise quickly
   python collect_activation_stats.py \\
-      --model_dir    /models/bf16_finetune \\
-      --output       calib_stats.json      \\
-      --prompts_file my_prompts.txt        \\
-      --max_tokens   512
+      --model_dir  ~/models/bf16_finetune \\
+      --output     calib_stats_397b.json  \\
+      --max_tokens 128
 
-  # Multi-GPU via accelerate
-  accelerate launch --multi_gpu collect_activation_stats.py \\
-      --model_dir /models/bf16_finetune \\
-      --output    calib_stats.json
+  # Custom prompts from a text file (one prompt per line)
+  python collect_activation_stats.py \\
+      --model_dir    ~/models/bf16_finetune \\
+      --output       calib_stats_397b.json  \\
+      --prompts_file my_prompts.txt
 """
 
 import json
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
@@ -68,9 +72,8 @@ logging.basicConfig(
 )
 
 # ── Patterns that identify ineligible weight tensors ───────────────────────────
-# MUST stay in sync with SKIP_PATTERNS in quantize_fp8.py.
+# Must stay in sync with SKIP_PATTERNS in quantize_fp8.py.
 # We only want hooks on layers that will actually be quantized.
-# Hooking extra layers wastes forward-pass memory and bloats the stats file.
 
 SKIP_PATTERNS = [
     # Embeddings & output
@@ -79,27 +82,29 @@ SKIP_PATTERNS = [
     "norm", "layernorm",
     # Gated DeltaNet SSM tensors
     "A_log", "dt_bias", "conv1d",
-    # Low-rank linear_attn projections (first dim < BLOCK_SIZE)
+    # Low-rank linear_attn projections (first dim < BLOCK_SIZE in quantizer)
     "in_proj_a", "in_proj_b",
-    # MoE router weights (kept BF16)
+    # MoE router weights (kept BF16 in all checkpoints)
     "shared_expert_gate", "mlp.gate.",
-    # MTP fusion weight (kept BF16)
+    # MTP fusion weight (kept BF16 in all checkpoints)
     "mtp.fc",
-    # Entire vision encoder — ViT blocks, merger, patch embed, pos embed
-    # (~100+ linear layers that are never quantized; skip to save hooks + memory)
+    # Entire vision encoder — never quantized
     "visual",
     # Misc
     "weight_scale_inv", "bias",
 ]
 
+BLOCK_SIZE = 128
+
 
 def _is_eligible(name: str, module: torch.nn.Module) -> bool:
+    """Return True if this module's weight will be FP8-quantized."""
     if not hasattr(module, "weight"):
         return False
     w = module.weight
     if w is None or w.ndim != 2:
         return False
-    if w.shape[0] < 128 or w.shape[1] < 128:
+    if w.shape[0] < BLOCK_SIZE or w.shape[1] < BLOCK_SIZE:
         return False
     for pat in SKIP_PATTERNS:
         if pat in name:
@@ -107,9 +112,96 @@ def _is_eligible(name: str, module: torch.nn.Module) -> bool:
     return True
 
 
+# ── Key normalization ──────────────────────────────────────────────────────────
+
+def _load_safetensors_weight_names(model_dir: Path) -> Optional[List[str]]:
+    """
+    Return the list of weight tensor names from the model's safetensors index.
+    Returns None if the index cannot be read (single-file or non-standard layout).
+    """
+    index_path = model_dir / "model.safetensors.index.json"
+    if not index_path.exists():
+        # Single-shard model — try to open it directly
+        shard_path = model_dir / "model.safetensors"
+        if shard_path.exists():
+            try:
+                from safetensors import safe_open
+                with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+                    return list(f.keys())
+            except Exception:
+                return None
+        return None
+
+    try:
+        with open(index_path) as f:
+            index = json.load(f)
+        return list(index.get("weight_map", {}).keys())
+    except Exception:
+        return None
+
+
+def _normalise_keys(
+    raw_stats:    Dict[str, torch.Tensor],
+    sf_names_set: set,
+) -> Dict[str, torch.Tensor]:
+    """
+    Remap stats keys to exactly match the safetensors key format.
+
+    named_modules() may produce keys with or without a leading "model."
+    component depending on the model class.  For example:
+
+      named_modules key : "language_model.layers.0.mlp.experts.0.down_proj.weight"
+      safetensors key   : "model.language_model.layers.0.mlp.experts.0.down_proj.weight"
+
+    Strategy: for each stats key, try the key as-is, then try stripping or
+    adding the common prefix variants until we find an exact match in the
+    safetensors key set.
+    """
+    normalised: Dict[str, torch.Tensor] = {}
+    unmatched: List[str] = []
+
+    for stats_key, val in raw_stats.items():
+        # 1. Exact match
+        if stats_key in sf_names_set:
+            normalised[stats_key] = val
+            continue
+
+        # 2. Try adding prefixes (stats key is shorter than safetensors key)
+        matched = None
+        for prefix in ("model.", "model.language_model."):
+            candidate = prefix + stats_key
+            if candidate in sf_names_set:
+                matched = candidate
+                break
+
+        if matched:
+            normalised[matched] = val
+            continue
+
+        # 3. Try stripping leading components from the stats key
+        parts = stats_key.split(".")
+        for i in range(1, len(parts) - 1):
+            candidate = ".".join(parts[i:])
+            if candidate in sf_names_set:
+                matched = candidate
+                break
+            for prefix in ("model.", "model.language_model."):
+                full = prefix + candidate
+                if full in sf_names_set:
+                    matched = full
+                    break
+            if matched:
+                break
+
+        if matched:
+            normalised[matched] = val
+        else:
+            unmatched.append(stats_key)
+
+    return normalised, unmatched
+
+
 # ── Default calibration prompts ────────────────────────────────────────────────
-# A short, diverse set that covers reasoning, code, math, multilingual, and
-# instruction-following — representative of Qwen3.5's expected workloads.
 
 DEFAULT_PROMPTS = [
     # Reasoning
@@ -125,7 +217,7 @@ DEFAULT_PROMPTS = [
     # Math
     "Prove that the square root of 2 is irrational.",
     "What is the derivative of f(x) = x^3 * sin(x)? Show the steps.",
-    # Long context / summarisation
+    # Summarisation
     "Summarise the key differences between transformer-based and recurrent "
     "architectures for sequence modelling.",
     # Instruction following
@@ -134,15 +226,13 @@ DEFAULT_PROMPTS = [
     # Multilingual
     "Translate the following sentence to French and explain any idiomatic "
     "differences: 'It's raining cats and dogs outside.'",
-    # Vision-language (text description)
-    "Describe what information you would need to determine the depth of an "
-    "object in a monocular photograph.",
     # Tool use / agent
     "You are an AI assistant with access to a calculator tool. "
     "The user asks: 'What is 17 factorial?' Explain your plan and compute it.",
-    # Diverse domain — biology
+    # Domain diversity
     "Describe the mechanism by which CRISPR-Cas9 introduces a double-strand "
     "break into target DNA.",
+    "What are the main differences between TCP and UDP? When would you use each?",
 ]
 
 
@@ -150,19 +240,17 @@ DEFAULT_PROMPTS = [
 
 class _ActivationCollector:
     """
-    Accumulates per-input-channel maximum absolute activations across
-    all forward passes and all sequence positions.
+    Accumulates per-input-channel maximum absolute activation across all
+    forward passes and all token positions.
 
-    For a linear layer with weight [out, in], the input to the layer has
-    shape [batch, seq_len, in].  We reduce over batch and seq_len, keeping
-    the running max per input channel (dim=-1).
+    For a linear layer weight [out, in], inputs arrive as [batch, seq, in]
+    or [tokens, in].  We keep a running max per input channel (last dim).
     """
 
     def __init__(self, in_features: int):
         self.channel_max = torch.zeros(in_features, dtype=torch.float32)
 
     def update(self, x: torch.Tensor) -> None:
-        # x: [batch, seq, in] or [tokens, in]
         flat = x.detach().float().reshape(-1, x.shape[-1])
         batch_max = flat.abs().max(dim=0).values.cpu()
         self.channel_max = torch.maximum(self.channel_max, batch_max)
@@ -170,8 +258,7 @@ class _ActivationCollector:
 
 def _make_hook(collector: _ActivationCollector):
     def hook(module, inputs, output):
-        x = inputs[0]
-        collector.update(x)
+        collector.update(inputs[0])
     return hook
 
 
@@ -188,14 +275,30 @@ def collect_stats(
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError:
         raise SystemExit(
-            "transformers is required. Install with: pip install transformers"
+            "transformers is required: pip install transformers"
         )
 
-    log.info("Loading tokenizer from %s ...", model_dir)
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+    # ── Load safetensors key list for later normalisation ──────────────────────
+    log.info("Reading safetensors weight names from %s ...", model_dir)
+    sf_names = _load_safetensors_weight_names(model_dir)
+    if sf_names is None:
+        log.warning(
+            "  Could not read safetensors index — "
+            "stats keys will use named_modules() format as-is."
+        )
+        sf_names_set = set()
+    else:
+        sf_names_set = set(sf_names)
+        log.info("  Found %d safetensors weight names.", len(sf_names_set))
 
-    log.info("Loading model from %s (device_map=%s) ...", model_dir, device_map)
-    log.info("  This may take several minutes for large models.")
+    # ── Load model ─────────────────────────────────────────────────────────────
+    log.info("Loading tokenizer from %s ...", model_dir)
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(model_dir), trust_remote_code=True
+    )
+
+    log.info("Loading model (device_map=%s) — this may take several minutes ...",
+             device_map)
     model = AutoModelForCausalLM.from_pretrained(
         str(model_dir),
         torch_dtype=torch.bfloat16,
@@ -210,12 +313,18 @@ def collect_stats(
 
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear) and _is_eligible(name, module):
-            weight_name = name + ".weight"
-            collector = _ActivationCollector(module.in_features)
-            collectors[weight_name] = collector
+            weight_key = name + ".weight"
+            collector  = _ActivationCollector(module.in_features)
+            collectors[weight_key] = collector
             hooks.append(module.register_forward_hook(_make_hook(collector)))
 
     log.info("Registered hooks on %d eligible layers.", len(collectors))
+
+    # Show a sample of what named_modules() produced so mismatches are visible
+    sample = list(collectors.keys())[:5]
+    log.info("  named_modules() key sample (first 5):")
+    for k in sample:
+        log.info("    %s", k)
 
     # ── Forward pass over calibration prompts ──────────────────────────────────
     log.info("Running %d calibration prompts (max_new_tokens=%d) ...",
@@ -229,7 +338,10 @@ def collect_stats(
                 return_tensors="pt",
                 truncation=True,
                 max_length=2048,
-            ).to(model.device)
+            )
+            # Move each input tensor to the model's first device
+            first_device = next(model.parameters()).device
+            inputs = {k: v.to(first_device) for k, v in inputs.items()}
 
             model.generate(
                 **inputs,
@@ -237,25 +349,60 @@ def collect_stats(
                 do_sample=False,
             )
 
-    # ── Remove hooks ───────────────────────────────────────────────────────────
     for h in hooks:
         h.remove()
     log.info("Hooks removed.")
 
-    # ── Serialise stats ────────────────────────────────────────────────────────
-    stats = {
-        weight_name: {
-            "input_channel_max": col.channel_max.tolist()
-        }
-        for weight_name, col in collectors.items()
+    # ── Build raw stats dict ───────────────────────────────────────────────────
+    raw_stats: Dict[str, torch.Tensor] = {
+        k: col.channel_max for k, col in collectors.items()
+    }
+
+    # ── Normalise keys to safetensors format ───────────────────────────────────
+    if sf_names_set:
+        log.info("Normalising stats keys to safetensors format ...")
+        normalised, unmatched = _normalise_keys(raw_stats, sf_names_set)
+
+        if unmatched:
+            log.warning(
+                "  %d stats keys could not be matched to any safetensors key "
+                "(they will be dropped):", len(unmatched)
+            )
+            for k in unmatched[:10]:
+                log.warning("    %s", k)
+            if len(unmatched) > 10:
+                log.warning("    ... and %d more", len(unmatched) - 10)
+
+        matched_count = len(normalised)
+        log.info(
+            "  Normalised %d / %d keys successfully.",
+            matched_count, len(raw_stats),
+        )
+
+        # Show a sample of normalised keys
+        norm_sample = list(normalised.keys())[:5]
+        log.info("  Normalised key sample (first 5):")
+        for k in norm_sample:
+            log.info("    %s", k)
+
+        final_stats = normalised
+    else:
+        log.info("  Skipping normalisation (no safetensors index available).")
+        final_stats = raw_stats
+
+    # ── Write output ───────────────────────────────────────────────────────────
+    output = {
+        weight_name: {"input_channel_max": val.tolist()}
+        for weight_name, val in final_stats.items()
     }
 
     with open(output_path, "w") as f:
-        json.dump(stats, f)
+        json.dump(output, f)
 
-    log.info("Wrote activation stats for %d layers to %s.", len(stats), output_path)
+    log.info("Wrote activation stats for %d layers to %s.",
+             len(output), output_path)
 
-    # Sanity: warn about layers with zero activation (likely never reached)
+    # Warn about layers with all-zero activations
     zero_layers = [
         k for k, col in collectors.items()
         if col.channel_max.max().item() == 0.0
@@ -283,10 +430,10 @@ def main() -> None:
                         help="Text file with one calibration prompt per line. "
                              "Uses built-in defaults when omitted.")
     parser.add_argument("--max_tokens", type=int, default=256,
-                        help="Max new tokens per prompt during calibration. "
-                             "(default: 256)")
+                        help="Max new tokens per prompt. (default: 256) "
+                             "128 is sufficient for activation stats.")
     parser.add_argument("--device_map", default="auto",
-                        help="Transformers device_map. Use 'auto' for multi-GPU, "
+                        help="Transformers device_map: 'auto' for multi-GPU, "
                              "'cpu' for CPU-only. (default: auto)")
     args = parser.parse_args()
 
