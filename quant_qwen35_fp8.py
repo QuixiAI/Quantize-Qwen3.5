@@ -988,6 +988,75 @@ def load_activation_stats(path: Path) -> ActivationStats:
     return stats
 
 
+# ── Model size detection & calib stats auto-discovery ─────────────────────────
+
+# (hidden_size, num_hidden_layers) → size label used in calib_stats_*.json
+_SIZE_LOOKUP: Dict[Tuple[int, int], str] = {
+    (4096, 60): "397b",
+    (3072, 48): "122b",
+    (2048, 40): "35b",
+    (5120, 64): "27b",
+    (4096, 32): "9b",
+    (2560, 32): "4b",
+    (2048, 24): "2b",
+    (1024, 24): "0.8b",
+}
+
+
+def _detect_model_size(input_dir: Path) -> Optional[str]:
+    """
+    Read config.json from input_dir and return the Qwen3.5 size label
+    (e.g. '397b', '9b', '0.8b'), or None if unrecognised.
+
+    Qwen3.5 vision-language models wrap the LM config under a 'text_config'
+    key.  Falls back to the top-level keys for plain language models.
+    """
+    config_path = input_dir / "config.json"
+    if not config_path.exists():
+        return None
+
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    # VL models nest LM config under text_config
+    lm_cfg = cfg.get("text_config", cfg)
+
+    hidden  = lm_cfg.get("hidden_size")
+    layers  = lm_cfg.get("num_hidden_layers")
+
+    if hidden is None or layers is None:
+        return None
+
+    return _SIZE_LOOKUP.get((hidden, layers))
+
+
+def _find_calib_stats(input_dir: Path) -> Optional[Path]:
+    """
+    Auto-discover a calib_stats_*.json file that matches the model in
+    input_dir.  Searches (in order):
+      1. The current working directory
+      2. The directory containing this script
+
+    Returns the Path if found, None otherwise.
+    """
+    size_label = _detect_model_size(input_dir)
+    if size_label is None:
+        return None
+
+    filename = f"calib_stats_{size_label}.json"
+    search_dirs = [Path.cwd(), Path(__file__).parent.resolve()]
+
+    for directory in search_dirs:
+        candidate = directory / filename
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
 # ── Shard processing ───────────────────────────────────────────────────────────
 
 def process_shard(
@@ -1107,8 +1176,30 @@ def main() -> None:
 
     # ── Activation stats ───────────────────────────────────────────────────────
     act_stats: ActivationStats = {}
+
     if args.activation_stats is not None:
+        # Explicit path provided — use it directly.
         act_stats = load_activation_stats(args.activation_stats)
+    else:
+        # No explicit path — try to auto-discover calib_stats_{size}.json.
+        auto_path = _find_calib_stats(args.input_dir)
+        if auto_path is not None:
+            log.info("Auto-detected activation stats: %s", auto_path)
+            act_stats = load_activation_stats(auto_path)
+        else:
+            size_label = _detect_model_size(args.input_dir)
+            if size_label is not None:
+                log.info(
+                    "No calib_stats_%s.json found in cwd or script dir — "
+                    "running without activation stats. "
+                    "Run collect_activation_stats.py to generate it.",
+                    size_label,
+                )
+            else:
+                log.info(
+                    "Model size unrecognised (config.json missing or unknown) — "
+                    "running without activation stats."
+                )
 
     calib_desc = args.calib_mode
     if args.calib_mode == "rms":
