@@ -1,8 +1,15 @@
-# Qwen3.5-397B FP8 Quantization Toolkit
+# Qwen3.5 FP8 Quantization Toolkit
 
 Block-wise FP8 E4M3 quantization for Qwen3.5 BF16 finetuned models.
+Supports all Qwen3.5 sizes across both MoE and dense families:
+
+| Family | Sizes |
+|---|---|
+| MoE | 397B-A17B, 122B-A10B, 35B-A3B |
+| Dense | 27B, 9B, 4B, 2B, 0.8B |
+
 Produces a checkpoint that is **drop-in compatible** with the official
-`Qwen/Qwen3.5-397B-A17B-FP8` format and loads directly in vLLM and SGLang
+`Qwen/Qwen3.5-*-FP8` format and loads directly in vLLM and SGLang
 without any engine modifications.
 
 ---
@@ -231,12 +238,15 @@ At 397B × 2 bytes ≈ ~800 GB VRAM. Options:
 
 ## Runtime estimates (single H100 80 GB)
 
-| Mode | ~Time for 397B |
-|---|---|
-| `rms` | 20–40 min |
-| `rms` + verify (20 samples) | 30–60 min |
-| `mse` (grid=50) | 3–6 hours |
-| `mse` + verify (20 samples) | 4–8 hours |
+| Model | Mode | ~Time |
+|---|---|---|
+| 397B-A17B | `rms` | 20–40 min |
+| 397B-A17B | `rms` + verify (20 samples) | 30–60 min |
+| 397B-A17B | `mse` (grid=50) | 3–6 hours |
+| 122B-A10B | `rms` | 8–15 min |
+| 35B-A3B | `rms` | 2–4 min |
+| 27B | `rms` | 2–4 min |
+| 9B and below | `rms` | < 2 min |
 
 ---
 
@@ -302,17 +312,34 @@ python -m sglang.launch_server \
 
 ## What gets quantized
 
-Eligible tensors (large 2D weight matrices in attention and MoE layers)
-are stored as FP8 E4M3. Everything else passes through unchanged:
+The same eligibility rules apply across all model sizes. Eligible tensors are large 2D weight matrices; everything else passes through unchanged.
+
+**Quantized → FP8 E4M3:**
+
+| Pattern | Example shape | Present in |
+|---|---|---|
+| `*linear_attn.in_proj_qkv.weight` | [12288, 4096] | All sizes |
+| `*linear_attn.in_proj_z.weight` | [8192, 4096] | All sizes |
+| `*linear_attn.out_proj.weight` | [4096, 8192] | All sizes |
+| `*self_attn.q_proj.weight` | [16384, 4096] | All sizes |
+| `*self_attn.k_proj.weight` | [512, 4096] | All sizes |
+| `*self_attn.v_proj.weight` | [512, 4096] | All sizes |
+| `*self_attn.o_proj.weight` | [4096, 8192] | All sizes |
+| `*mlp.experts.*.{down,gate,up}_proj.weight` | [4096, 1024] | MoE only |
+| `*mlp.shared_expert.{down,gate,up}_proj.weight` | [4096, 1024] | MoE only |
+| `*mlp.{down,gate,up}_proj.weight` | [5120, 17408] | Dense only |
+| `mtp.layers.0.*` (attention + MLP) | varies | All sizes |
+
+**Kept in BF16/F32 (never quantized):**
 
 | Tensor | Dtype | Reason |
 |---|---|---|
-| `*in_proj_qkv.weight`, `*out_proj.weight`, `*in_proj_z.weight` | FP8 | Large attention projections |
-| `*experts.*.{down,gate,up}_proj.weight` | FP8 | Expert MLP weights |
-| `*shared_expert.{down,gate,up}_proj.weight` | FP8 | Shared expert weights |
-| `embed_tokens.weight` | BF16 | Embedding lookup, no matmul |
+| `embed_tokens.weight`, `lm_head.weight` | BF16 | Embedding lookup, no matmul |
 | `*norm*`, `*layernorm*` | BF16 | Numerically sensitive |
-| `*in_proj_a.weight`, `*in_proj_b.weight` | BF16 | Small low-rank [64, 4096] |
-| `*A_log*` | F32 | SSM state parameter |
-| `*dt_bias*`, `*conv1d*` | BF16 | SSM auxiliary tensors |
-| `*shared_expert_gate.weight` | BF16 | Router gate [1, 4096] |
+| `*linear_attn.in_proj_a/b.weight` | BF16 | Low-rank [heads, hidden]; first dim < 128 |
+| `*linear_attn.A_log` | F32 | SSM state parameter |
+| `*linear_attn.dt_bias`, `*conv1d*` | BF16 | SSM auxiliary tensors |
+| `*shared_expert_gate.weight` | BF16 | Router gate [1, hidden] |
+| `*mlp.gate.weight` | BF16 | Expert router [n_experts, hidden] |
+| `mtp.fc.weight` | BF16 | MTP hidden-state fusion; BF16 in all official checkpoints |
+| `model.visual.*` | BF16 | Entire vision encoder (ViT blocks, merger, patch embed) |
