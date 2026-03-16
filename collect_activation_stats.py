@@ -3,6 +3,11 @@
 Collect per-layer input-activation statistics from a BF16 Qwen3.5 model
 for use with the activation-aware calibration pass in quantize_fp8.py.
 
+Supports all Qwen3.5 sizes across both MoE and dense families:
+
+  MoE   : 397B-A17B, 122B-A10B, 35B-A3B
+  Dense : 27B, 9B, 4B, 2B, 0.8B
+
 What this does
 ──────────────
 Registers forward hooks on every eligible linear layer, runs a small set of
@@ -25,8 +30,7 @@ Hardware requirements
 Running a 397B model requires a multi-GPU setup (8× H100 80 GB or similar).
 Use tensor_parallel via accelerate / vLLM offline batching / FSDP for loading.
 
-For smaller finetuned models (e.g. a LoRA-merged 7B or 72B variant) this
-script can run on a single GPU.
+For smaller models (9B and below) this script runs on a single GPU.
 
 Usage
 ─────
@@ -63,13 +67,28 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-# ── Patterns that identify eligible weight tensors ─────────────────────────────
-# Must stay in sync with SKIP_PATTERNS in quantize_fp8.py.
+# ── Patterns that identify ineligible weight tensors ───────────────────────────
+# MUST stay in sync with SKIP_PATTERNS in quantize_fp8.py.
+# We only want hooks on layers that will actually be quantized.
+# Hooking extra layers wastes forward-pass memory and bloats the stats file.
 
 SKIP_PATTERNS = [
-    "embed_tokens", "lm_head", "norm", "layernorm",
+    # Embeddings & output
+    "embed_tokens", "lm_head",
+    # Normalization
+    "norm", "layernorm",
+    # Gated DeltaNet SSM tensors
     "A_log", "dt_bias", "conv1d",
-    "in_proj_a", "in_proj_b", "shared_expert_gate",
+    # Low-rank linear_attn projections (first dim < BLOCK_SIZE)
+    "in_proj_a", "in_proj_b",
+    # MoE router weights (kept BF16)
+    "shared_expert_gate", "mlp.gate.",
+    # MTP fusion weight (kept BF16)
+    "mtp.fc",
+    # Entire vision encoder — ViT blocks, merger, patch embed, pos embed
+    # (~100+ linear layers that are never quantized; skip to save hooks + memory)
+    "visual",
+    # Misc
     "weight_scale_inv", "bias",
 ]
 
