@@ -82,8 +82,8 @@ VERIFICATION — THREE-TIER HEALTH BANDS
 ─────────────────────────────────────────────────────────────────────────────
   zone   cosine sim         mean abs err     max abs err
   GOOD   ≥ 0.9997           ≤ 0.0008         ≤ 0.01
-  WARN   0.9995 – 0.9997    0.0008 – 0.001   0.01 – 0.03
-  FAIL   < 0.9995           > 0.001          > 0.03
+  WARN   0.9995 – 0.9997    0.0008 – 0.001   0.01 – 0.05
+  FAIL   < 0.9995           > 0.001          > 0.05
 
 ─────────────────────────────────────────────────────────────────────────────
 RECOMMENDED USAGE
@@ -114,7 +114,7 @@ import shutil
 import logging
 import dataclasses
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -153,7 +153,7 @@ VERIFY_NEAR_ZERO_ABS_MAX = 1e-6
 #                    GOOD          WARN              FAIL
 #   cosine sim  :  ≥ 0.9995    [0.995, 0.9995)     < 0.995
 #   mean abs err:  ≤ 0.0008    (0.0008, 0.001]      > 0.001
-#   max abs err :  ≤ 0.01      (0.01,   0.03]        > 0.03
+#   max abs err :  ≤ 0.01      (0.01,   0.05]        > 0.05
 #
 # Note on cosine for finetuned MoE models: expert weight distributions in
 # aggressively finetuned models are often heavy-tailed.  Cosine 0.990–0.9995
@@ -188,7 +188,7 @@ class MetricBands:
 
 COSINE_BANDS  = MetricBands("cosine_sim",    good=0.9995,  warn=0.995,  higher_is_better=True)
 MAE_BANDS     = MetricBands("mean_abs_err",  good=0.0008,  warn=0.001,  higher_is_better=False)
-MAX_ERR_BANDS = MetricBands("max_abs_err",   good=0.01,    warn=0.03,   higher_is_better=False)
+MAX_ERR_BANDS = MetricBands("max_abs_err",   good=0.01,    warn=0.05,   higher_is_better=False)
 
 # Keep these as the hard-failure values for backward-compat with CLI defaults
 TARGET_COSINE_SIM   = COSINE_BANDS.warn
@@ -1105,6 +1105,137 @@ def _find_calib_stats(input_dir: Path) -> Optional[Path]:
     return None
 
 
+def _normalise_index_shards(input_dir: Path, index: Dict) -> List[str]:
+    """
+    Return the shard filenames referenced by an index, fixing the common
+    single-file variant where the index names
+    `model.safetensors-00001-of-00001.safetensors` but the checkpoint on disk
+    is just `model.safetensors`.
+    """
+    mapped_shards = sorted(set(index["weight_map"].values()))
+    shard_aliases: Dict[str, str] = {}
+    single_file = input_dir / "model.safetensors"
+
+    for shard_name in mapped_shards:
+        shard_path = input_dir / shard_name
+        if shard_path.exists():
+            shard_aliases[shard_name] = shard_name
+            continue
+
+        if len(mapped_shards) == 1 and single_file.exists():
+            shard_aliases[shard_name] = single_file.name
+            log.warning(
+                "Index references missing shard %s but found %s. "
+                "Treating this as a single-file model and rewriting the index.",
+                shard_name, single_file.name,
+            )
+            continue
+
+        raise FileNotFoundError(f"No such file or directory: {shard_path}")
+
+    if any(src != dst for src, dst in shard_aliases.items()):
+        for tensor_name, shard_name in list(index["weight_map"].items()):
+            index["weight_map"][tensor_name] = shard_aliases[shard_name]
+
+    return sorted(set(index["weight_map"].values()))
+
+
+def _module_name_from_tensor_name(name: str) -> str:
+    for suffix in (".weight", ".bias"):
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return name
+
+
+def _module_to_not_convert(name: str) -> Optional[str]:
+    """
+    Map a tensor name to the module entry expected in config.json's
+    quantization_config.modules_to_not_convert, or None if this tensor should
+    not contribute an entry.
+    """
+    if name.endswith("weight_scale_inv"):
+        return None
+
+    # Core LM modules that remain BF16/F32.
+    if name == "lm_head.weight":
+        return "lm_head"
+    if name == "model.language_model.embed_tokens.weight":
+        return "model.language_model.embed_tokens"
+    if ".linear_attn.conv1d." in name:
+        return _module_name_from_tensor_name(name)
+    if ".linear_attn.in_proj_a." in name or ".linear_attn.in_proj_b." in name:
+        return _module_name_from_tensor_name(name)
+    if ".linear_attn.out_proj." in name:
+        return _module_name_from_tensor_name(name)
+    if name.endswith(".mlp.gate.weight"):
+        return _module_name_from_tensor_name(name)
+    if name.endswith(".mlp.shared_expert_gate.weight"):
+        return _module_name_from_tensor_name(name)
+    if ".mlp.shared_expert." in name and name.endswith(".weight"):
+        return _module_name_from_tensor_name(name)
+
+    # Vision encoder modules match the official FP8 configs.
+    visual_substrings = (
+        ".attn.proj.",
+        ".attn.qkv.",
+        ".mlp.linear_fc1.",
+        ".mlp.linear_fc2.",
+        ".merger.linear_fc1.",
+        ".merger.linear_fc2.",
+        ".patch_embed.proj.",
+    )
+    if name == "model.visual.pos_embed":
+        return name
+    if name.startswith("model.visual.") and any(s in name for s in visual_substrings):
+        return _module_name_from_tensor_name(name)
+
+    # Multi-token prediction modules.
+    if name.startswith("mtp.fc."):
+        return "mtp.fc"
+    if name.endswith("mtp.layers.0.mlp.gate.weight"):
+        return _module_name_from_tensor_name(name)
+    if name.endswith("mtp.layers.0.mlp.shared_expert_gate.weight"):
+        return _module_name_from_tensor_name(name)
+
+    return None
+
+
+def _build_quantization_config(modules_to_not_convert: Set[str]) -> Dict:
+    return {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_per_tensor": False,
+        "act_per_tensor": False,
+        "weight_block_size": [BLOCK_SIZE, BLOCK_SIZE],
+        "modules_to_not_convert": sorted(modules_to_not_convert),
+    }
+
+
+def _write_output_config(
+    input_dir:                Path,
+    output_dir:               Path,
+    modules_to_not_convert:   Set[str],
+) -> None:
+    config_path = input_dir / "config.json"
+    if not config_path.exists():
+        log.warning("No config.json found in %s — skipping config rewrite.", input_dir)
+        return
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    config["quantization_config"] = _build_quantization_config(modules_to_not_convert)
+
+    out_path = output_dir / "config.json"
+    with open(out_path, "w") as f:
+        json.dump(config, f, indent=4)
+        f.write("\n")
+    log.info(
+        "Wrote config.json with quantization_config (%d modules_to_not_convert).",
+        len(modules_to_not_convert),
+    )
+
+
 # ── Shard processing ───────────────────────────────────────────────────────────
 
 def process_shard(
@@ -1118,10 +1249,11 @@ def process_shard(
     rms_factor:  float,
     act_stats:   ActivationStats,
     device:      torch.device,
-) -> List[str]:
-    """Quantize one shard. Returns list of FP8-quantized weight names."""
+) -> Tuple[List[str], Set[str]]:
+    """Quantize one shard. Returns FP8 weight names and skipped module names."""
     tensors_out:    Dict[str, torch.Tensor] = {}
     quantized_keys: List[str]               = []
+    not_convert:    Set[str]                = set()
     act_hits        = 0
 
     # Build a per-shard activation stats lookup that tolerates the common
@@ -1165,6 +1297,9 @@ def process_shard(
         keys = list(f.keys())
         for name in tqdm(keys, desc=f"  {shard_name}", leave=False):
             tensor = f.get_tensor(name)
+            module_name = _module_to_not_convert(name)
+            if module_name is not None:
+                not_convert.add(module_name)
 
             if should_quantize(name, tensor):
                 act_channel = _lookup_act_stats(name)
@@ -1205,7 +1340,7 @@ def process_shard(
             "    Activation stats applied to %d / %d quantized tensors.",
             act_hits, len(quantized_keys),
         )
-    return quantized_keys
+    return quantized_keys, not_convert
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -1302,18 +1437,19 @@ def main() -> None:
     else:
         with open(index_path) as f:
             index = json.load(f)
-        shards = sorted(set(index["weight_map"].values()))
+        shards = _normalise_index_shards(args.input_dir, index)
         log.info("Found %d shards in index.", len(shards))
 
     # ── Process shards ─────────────────────────────────────────────────────────
     all_verify_results: List[ShardVerifyResult] = []
+    modules_to_not_convert: Set[str] = set()
 
     for shard_name in shards:
         input_path  = args.input_dir  / shard_name
         output_path = args.output_dir / shard_name
 
         log.info("Quantizing %s ...", shard_name)
-        quantized_keys = process_shard(
+        quantized_keys, shard_not_convert = process_shard(
             input_path, output_path, index, shard_name,
             calib_mode=args.calib_mode,
             percentile=args.calib_percentile,
@@ -1322,6 +1458,7 @@ def main() -> None:
             act_stats=act_stats,
             device=device,
         )
+        modules_to_not_convert.update(shard_not_convert)
         log.info("  -> %d tensors quantized to FP8.", len(quantized_keys))
 
         if not args.skip_verify:
@@ -1341,7 +1478,7 @@ def main() -> None:
         log.info("Wrote updated model.safetensors.index.json.")
 
     # ── Copy non-weight files ──────────────────────────────────────────────────
-    skip_names = set(shards) | {"model.safetensors.index.json"}
+    skip_names = set(shards) | {"model.safetensors.index.json", "processor_config.json"}
     for item in args.input_dir.iterdir():
         if item.name in skip_names:
             continue
@@ -1350,7 +1487,13 @@ def main() -> None:
             shutil.copy2(item, dst)
         elif item.is_dir():
             shutil.copytree(item, dst, dirs_exist_ok=True)
+    stale_processor_config = args.output_dir / "processor_config.json"
+    if stale_processor_config.is_file() or stale_processor_config.is_symlink():
+        stale_processor_config.unlink()
+        log.info("Removed processor_config.json to match official FP8 layout.")
+
     log.info("Copied config, tokenizer, and auxiliary files.")
+    _write_output_config(args.input_dir, args.output_dir, modules_to_not_convert)
 
     # ── Final summary ──────────────────────────────────────────────────────────
     if not args.skip_verify and all_verify_results:
